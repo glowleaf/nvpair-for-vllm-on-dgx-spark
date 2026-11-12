@@ -30,6 +30,60 @@ Measurements from the shipped PAIR v1.0.0 binaries (`nvpair-engine-manager`, `-w
 
 Adoption is documented for "Ollama or LM Studio"; **llama.cpp is always a PAIR-managed install**. So on a DGX Spark where the 27B lives in NVFP4/SGLang format, the only ways to get PAIR serving it are (a) load a second GGUF copy in RAM, or (b) this façade. (b) costs a few MB of RSS.
 
+## The second contract: PAIR enumerates with `GET /models`
+
+The Ollama façade above works, but it is not the only way in, and on a DGX Spark it is not the
+cheapest. PAIR's **llama.cpp** engine can be pointed at a bridge on `:8081` that keeps the
+upstream OpenAI server exactly where it is. Getting that to advertise models needs **two**
+contracts, and the second one is the one nobody documents:
+
+| Contract | Endpoint PAIR probes | What it decides |
+|---|---|---|
+| readiness | `GET /props` | engine shows **HEALTHY** |
+| enumeration | `GET /models` (llama.cpp router shape) | node **advertises** its models |
+
+`GET /props` returning `{"role":"router"}` hardcodes llama.cpp. That alone is not enough:
+vLLM and SGLang answer `/v1/models` and **404 on `/models`**, so the engine goes green and the
+node advertises nothing. Measured on a DGX Spark with PAIR v1.0.0 and SGLang on `:8888`:
+
+```
+$ journalctl -u pair-bridge | tail
+GET /models -> 404          # repeated, every refresh
+$ curl -s localhost:8080/v1/models        # PAIR's own proxy
+{"error":"no available node advertises the requested model"}
+```
+
+`pair_llamacpp_bridge.py` fixes that: it answers `/models` itself by reshaping the upstream's
+`/v1/models` into llama.cpp's shape, and proxies everything else untouched (including
+`Server: llama.cpp`, which PAIR sniffs).
+
+```bash
+python3 pair_llamacpp_bridge.py 8081 8888 qwen3.8-27b-sglang /home/me/models/current 27000000000 NVFP4 262144
+#                        listen upstream alias              model_path               n_params ftype  n_ctx
+```
+
+Then point PAIR's llama.cpp engine port at `8081` and restart the node's registration:
+
+```
+ENGINE     INSTALLED  RUNNING  HEALTHY  ENGINE PORT  PROXY PORT
+llama.cpp  yes        yes      yes      8081         8082
+Models
+  qwen3.8-27b-sglang
+```
+
+Verified end to end: `curl -s localhost:8082/v1/chat/completions -d '{"model":"qwen3.8-27b-sglang",...}'`
+returned a completion, and the cluster inventory listed the model within 15 s of registration.
+`n_ctx` must be passed explicitly: PAIR reads it from the `/models` metadata, so a hardcoded
+8192 advertises 8192 even when the model serves 262144.
+
+### Which bridge to use
+
+- **Ollama façade** (`vllm_ollama_bridge.py`, port `11434`) when PAIR must treat the node as an
+  Ollama node, or when you want `/api/chat` translation.
+- **llama.cpp bridge** (`pair_llamacpp_bridge.py`, port `8081`) when the node is joining a
+  cluster of llama.cpp nodes. It is a pass-through for `/v1/*`, so streaming, tool calls and
+  long contexts behave exactly as the upstream does.
+
 ## Requirements
 
 - NVIDIA PAIR v1.0.0+ installed on the node (`nvpair` on PATH).
